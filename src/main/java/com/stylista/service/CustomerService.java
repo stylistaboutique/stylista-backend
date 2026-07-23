@@ -22,14 +22,8 @@ public class CustomerService {
 
     /**
      * Add a new customer or update an existing one (matched by mobile).
-     *
-     * Measurement rule (per requirement):
-     * - For an EXISTING customer, the incoming measurements are MERGED onto the
-     *   saved measurements: any measurement field present (non-blank) in the new
-     *   payload overwrites the old value, so future measurement changes update.
-     * - EXCEPTION: the "notes" field (the "Other notes" measurement) is PRESERVED
-     *   from the existing record — the new payload does NOT overwrite it. This keeps
-     *   long-lived notes intact across repeat orders.
+     * Measurements MERGE on repeat customers; the "notes" (Other notes) field
+     * is sticky: preserved once set, but allowed through the first time.
      */
     public Customer addOrUpdate(String name, String mobile, String measurements) {
         Optional<Customer> existing = customerRepo.findByMobile(mobile);
@@ -52,12 +46,6 @@ public class CustomerService {
         return customerRepo.save(c);
     }
 
-    /**
-     * Merge new measurement JSON onto old.
-     * - New non-blank values overwrite old values.
-     * - The "notes" (Other notes) field is always kept from the OLD record.
-     * If either side is not valid JSON, we fall back gracefully.
-     */
     @SuppressWarnings("unchecked")
     private String mergeMeasurements(String oldJson, String newJson) {
         try {
@@ -68,37 +56,35 @@ public class CustomerService {
                     ? new LinkedHashMap<>()
                     : MAPPER.readValue(newJson, LinkedHashMap.class);
 
+            Object oldNotes = oldMap.get("notes");
+            boolean oldHasNote = oldNotes != null && !oldNotes.toString().isBlank();
+
             Map<String, Object> merged = new LinkedHashMap<>(oldMap);
             for (Map.Entry<String, Object> e : newMap.entrySet()) {
-                if ("notes".equals(e.getKey())) continue; // preserve Other notes from old
+                String key = e.getKey();
                 Object v = e.getValue();
-                if (v != null && !v.toString().isBlank()) {
-                    merged.put(e.getKey(), v);
+                boolean blank = (v == null || v.toString().isBlank());
+
+                if ("notes".equals(key)) {
+                    if (!oldHasNote && !blank) merged.put("notes", v);
+                    continue;
                 }
+                if (!blank) merged.put(key, v);
             }
-            // Ensure old notes survive even if old JSON lacked the key layout
-            if (oldMap.containsKey("notes")) merged.put("notes", oldMap.get("notes"));
+            if (oldHasNote) merged.put("notes", oldNotes);
 
             return MAPPER.writeValueAsString(merged);
         } catch (Exception ex) {
-            // If parsing fails, keep the old measurements to avoid data loss
             return (oldJson != null && !oldJson.isBlank()) ? oldJson : newJson;
         }
     }
 
-    public List<Customer> allCustomers() {
-        return customerRepo.findAll();
-    }
+    public List<Customer> allCustomers() { return customerRepo.findAll(); }
 
-    public Optional<Customer> findById(Long id) {
-        return customerRepo.findById(id);
-    }
+    public Optional<Customer> findById(Long id) { return customerRepo.findById(id); }
 
-    public Optional<Customer> findByMobile(String mobile) {
-        return customerRepo.findByMobile(mobile);
-    }
+    public Optional<Customer> findByMobile(String mobile) { return customerRepo.findByMobile(mobile); }
 
-    /** Update measurements only (patch) — full overwrite from the customer detail page. */
     public Optional<Customer> updateMeasurements(Long id, String measurements) {
         return customerRepo.findById(id).map(c -> {
             c.setMeasurements(measurements);
