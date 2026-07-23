@@ -87,6 +87,32 @@ public class AdminController {
         return ResponseEntity.ok(Map.of("customers", list));
     }
 
+    /**
+     * GET /api/admin/customers/lookup?mobile=9876543210
+     * Used by the New Order form: type a mobile → auto-populate name + measurements.
+     * Returns { found: true, customer: {...} } or { found: false }.
+     */
+    @GetMapping("/customers/lookup")
+    public ResponseEntity<Map<String, Object>> lookupCustomer(
+            @RequestHeader(value = "Authorization", required = false) String auth,
+            @RequestParam String mobile) {
+        if (!isAuthorized(auth)) return unauthorized();
+        String m = mobile == null ? "" : mobile.trim();
+        return customerService.findByMobile(m)
+                .map(c -> {
+                    Map<String, Object> res = new LinkedHashMap<>();
+                    res.put("found", true);
+                    res.put("customer", customerMap(c));
+                    res.put("live_balance", cashbackService.getLiveBalance(c.getId()));
+                    return ResponseEntity.ok(res);
+                })
+                .orElseGet(() -> {
+                    Map<String, Object> res = new LinkedHashMap<>();
+                    res.put("found", false);
+                    return ResponseEntity.ok(res);
+                });
+    }
+
     @PostMapping("/customers")
     public ResponseEntity<Map<String, Object>> addCustomer(
             @RequestHeader(value = "Authorization", required = false) String auth,
@@ -148,6 +174,29 @@ public class AdminController {
         List<Map<String, Object>> list = orderService.allOrdersByPriority().stream()
                 .map(this::orderMap).collect(Collectors.toList());
         return ResponseEntity.ok(Map.of("orders", list));
+    }
+
+    /**
+     * GET /api/admin/orders/{id}
+     * Full order detail incl. customer + tailor info for the clickable order view.
+     */
+    @GetMapping("/orders/{id}")
+    public ResponseEntity<Map<String, Object>> getOrder(
+            @RequestHeader(value = "Authorization", required = false) String auth,
+            @PathVariable Long id) {
+        if (!isAuthorized(auth)) return unauthorized();
+        return orderService.findById(id)
+                .map(o -> {
+                    Map<String, Object> res = new LinkedHashMap<>(orderMap(o));
+                    customerService.findById(o.getCustomerId()).ifPresent(c ->
+                            res.put("customer_measurements", c.getMeasurements()));
+                    if (o.getTailorId() != null) {
+                        tailorService.findById(o.getTailorId()).ifPresent(t ->
+                                res.put("tailor_name", t.getName()));
+                    }
+                    return ResponseEntity.ok(res);
+                })
+                .orElseGet(() -> notFound("Order not found."));
     }
 
     /**
@@ -266,10 +315,15 @@ public class AdminController {
         if (!isAuthorized(auth)) return unauthorized();
 
         Long customerId = longOrNull(body.get("customer_id"));
+        String mobile   = str(body.get("mobile"));
+        // Allow assigning by mobile too (Cashbacks tab convenience)
+        if (customerId == null && !mobile.isBlank()) {
+            customerId = customerService.findByMobile(mobile).map(Customer::getId).orElse(null);
+        }
         Integer amount  = intOrNull(body.get("cashback_amount"));
         if (customerId == null || amount == null || amount <= 0)
             return ResponseEntity.badRequest()
-                    .body(Map.of("message", "customer_id and cashback_amount required."));
+                    .body(Map.of("message", "A valid customer (id or mobile) and cashback_amount required."));
 
         CashbackAssignment cb = cashbackService.assignCashback(
                 customerId,
@@ -325,6 +379,11 @@ public class AdminController {
         return ResponseEntity.ok(Map.of("message", "Tailor added.", "tailor", tailorMap(saved)));
     }
 
+    /**
+     * PATCH /api/admin/tailors/{id}
+     * Update fields OR toggle active. Send { "active": true } to REACTIVATE a
+     * previously deactivated tailor, or { "active": false } to deactivate.
+     */
     @PatchMapping("/tailors/{id}")
     public ResponseEntity<Map<String, Object>> updateTailor(
             @RequestHeader(value = "Authorization", required = false) String auth,
