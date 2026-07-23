@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: stylista-backend
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: DATABASE_URL
+        sync: false          # You paste the Supabase URI manually in Render dashboard
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        value: stylista@2025  # Change this in Render dashboard!
+      - key: ADMIN_TOKEN_SECRET
+        generateValue: true   # Render auto-generates a secure secret
+      - key: NOTIFICATIONS_ENABLED
+        value: "false"
+      - key: CORS_ORIGINS
+        value: "https://stylistaboutique.com,https://www.stylistaboutique.com"
