@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install PostgreSQL client (v16)
         run: |
@@ -28,14 +28,31 @@ jobs:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           JDBC_DATABASE_URL: ${{ secrets.JDBC_DATABASE_URL }}
         run: |
+          set -euo pipefail
           mkdir -p backups
           STAMP=$(date -u +'%Y-%m')
+
           BASE="${JDBC_DATABASE_URL#jdbc:}"
           HOSTPART="${BASE#postgresql://}"
           ENC_PASS=$(python3 -c "import urllib.parse,os;print(urllib.parse.quote(os.environ['DB_PASSWORD'],safe=''))")
           CONN="postgresql://${DB_USERNAME}:${ENC_PASS}@${HOSTPART}"
-          echo "Dumping to backups/stylista-${STAMP}.sql.gz"
-          pg_dump "$CONN" --no-owner --no-privileges | gzip > "backups/stylista-${STAMP}.sql.gz"
+
+          echo "Testing connection..."
+          psql "$CONN" -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';"
+
+          echo "Dumping (uncompressed first, so failures are caught)..."
+          pg_dump "$CONN" --no-owner --no-privileges > "backups/stylista-${STAMP}.sql"
+
+          RAW_SIZE=$(stat -c%s "backups/stylista-${STAMP}.sql")
+          echo "Raw dump size: ${RAW_SIZE} bytes"
+          if [ "$RAW_SIZE" -lt 200 ]; then
+            echo "ERROR: dump is suspiciously small (${RAW_SIZE} bytes). Something went wrong."
+            cat "backups/stylista-${STAMP}.sql"
+            exit 1
+          fi
+
+          gzip -f "backups/stylista-${STAMP}.sql"
+          echo "Final file:"
           ls -lh backups/
 
       - name: Prune dumps older than 12 months
