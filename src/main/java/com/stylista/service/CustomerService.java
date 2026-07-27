@@ -21,19 +21,18 @@ public class CustomerService {
     }
 
     /**
-     * Add a new customer or update an existing one (matched by mobile).
-     * Measurements MERGE on repeat customers; the "notes" (Other notes) field
-     * is sticky: preserved once set, but allowed through the first time.
+     * Add or update keyed on (name + mobile). A repeat (same name+mobile) merges
+     * measurements; a new name on an existing mobile creates a SEPARATE customer.
      */
     public Customer addOrUpdate(String name, String mobile, String measurements) {
-        Optional<Customer> existing = customerRepo.findByMobile(mobile);
+        Optional<Customer> existing = customerRepo.findByNameAndMobile(name, mobile);
 
         Customer c = existing.orElseGet(() -> {
             Customer fresh = new Customer();
             fresh.setMobile(mobile);
+            fresh.setName(name);
             return fresh;
         });
-
         if (name != null && !name.isBlank()) c.setName(name);
 
         if (measurements != null) {
@@ -50,29 +49,21 @@ public class CustomerService {
     private String mergeMeasurements(String oldJson, String newJson) {
         try {
             Map<String, Object> oldMap = (oldJson == null || oldJson.isBlank())
-                    ? new LinkedHashMap<>()
-                    : MAPPER.readValue(oldJson, LinkedHashMap.class);
+                    ? new LinkedHashMap<>() : MAPPER.readValue(oldJson, LinkedHashMap.class);
             Map<String, Object> newMap = (newJson == null || newJson.isBlank())
-                    ? new LinkedHashMap<>()
-                    : MAPPER.readValue(newJson, LinkedHashMap.class);
+                    ? new LinkedHashMap<>() : MAPPER.readValue(newJson, LinkedHashMap.class);
 
             Object oldNotes = oldMap.get("notes");
             boolean oldHasNote = oldNotes != null && !oldNotes.toString().isBlank();
 
             Map<String, Object> merged = new LinkedHashMap<>(oldMap);
             for (Map.Entry<String, Object> e : newMap.entrySet()) {
-                String key = e.getKey();
-                Object v = e.getValue();
+                String key = e.getKey(); Object v = e.getValue();
                 boolean blank = (v == null || v.toString().isBlank());
-
-                if ("notes".equals(key)) {
-                    if (!oldHasNote && !blank) merged.put("notes", v);
-                    continue;
-                }
+                if ("notes".equals(key)) { if (!oldHasNote && !blank) merged.put("notes", v); continue; }
                 if (!blank) merged.put(key, v);
             }
             if (oldHasNote) merged.put("notes", oldNotes);
-
             return MAPPER.writeValueAsString(merged);
         } catch (Exception ex) {
             return (oldJson != null && !oldJson.isBlank()) ? oldJson : newJson;
@@ -80,16 +71,13 @@ public class CustomerService {
     }
 
     public List<Customer> allCustomers() { return customerRepo.findAll(); }
-
     public Optional<Customer> findById(Long id) { return customerRepo.findById(id); }
 
-    public Optional<Customer> findByMobile(String mobile) { return customerRepo.findByMobile(mobile); }
+    // Now returns ALL customers on a mobile (may be >1)
+    public List<Customer> findAllByMobile(String mobile) { return customerRepo.findByMobile(mobile); }
 
     public Optional<Customer> updateMeasurements(Long id, String measurements) {
-        return customerRepo.findById(id).map(c -> {
-            c.setMeasurements(measurements);
-            return customerRepo.save(c);
-        });
+        return customerRepo.findById(id).map(c -> { c.setMeasurements(measurements); return customerRepo.save(c); });
     }
 
     public long totalCustomers() { return customerRepo.count(); }

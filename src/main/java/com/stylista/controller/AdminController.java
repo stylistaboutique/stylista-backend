@@ -87,30 +87,25 @@ public class AdminController {
         return ResponseEntity.ok(Map.of("customers", list));
     }
 
-    /**
-     * GET /api/admin/customers/lookup?mobile=9876543210
-     * Used by the New Order form: type a mobile → auto-populate name + measurements.
-     * Returns { found: true, customer: {...} } or { found: false }.
-     */
     @GetMapping("/customers/lookup")
     public ResponseEntity<Map<String, Object>> lookupCustomer(
             @RequestHeader(value = "Authorization", required = false) String auth,
             @RequestParam String mobile) {
         if (!isAuthorized(auth)) return unauthorized();
         String m = mobile == null ? "" : mobile.trim();
-        return customerService.findByMobile(m)
-                .map(c -> {
-                    Map<String, Object> res = new LinkedHashMap<>();
-                    res.put("found", true);
-                    res.put("customer", customerMap(c));
-                    res.put("live_balance", cashbackService.getLiveBalance(c.getId()));
-                    return ResponseEntity.ok(res);
-                })
-                .orElseGet(() -> {
-                    Map<String, Object> res = new LinkedHashMap<>();
-                    res.put("found", false);
-                    return ResponseEntity.ok(res);
-                });
+        List<Customer> matches = customerService.findAllByMobile(m);
+        Map<String, Object> res = new LinkedHashMap<>();
+        if (matches.isEmpty()) { res.put("found", false); return ResponseEntity.ok(res); }
+        List<Map<String, Object>> arr = matches.stream().map(c -> {
+            Map<String, Object> cm = new LinkedHashMap<>(customerMap(c));
+            cm.put("live_balance", cashbackService.getLiveBalance(c.getId()));
+            return cm;
+        }).collect(Collectors.toList());
+        res.put("found", true);
+        res.put("customers", arr);
+        res.put("customer", arr.get(0));                 // back-compat
+        res.put("live_balance", arr.get(0).get("live_balance"));
+        return ResponseEntity.ok(res);
     }
 
     @PostMapping("/customers")
@@ -162,17 +157,15 @@ public class AdminController {
 
     // ==================== ORDERS ====================
 
-    /**
-     * GET /api/admin/orders
-     * Returns all orders sorted by due_date ASC (overdue first, no-date last).
-     * Each order includes customer name + mobile for display.
-     */
     @GetMapping("/orders")
     public ResponseEntity<Map<String, Object>> listOrders(
-            @RequestHeader(value = "Authorization", required = false) String auth) {
+            @RequestHeader(value = "Authorization", required = false) String auth,
+            @RequestParam(value = "include_deleted", required = false, defaultValue = "false") boolean includeDeleted) {
         if (!isAuthorized(auth)) return unauthorized();
-        List<Map<String, Object>> list = orderService.allOrdersByPriority().stream()
-                .map(this::orderMap).collect(Collectors.toList());
+        List<Order> src = includeDeleted
+                ? orderService.allOrdersIncludingDeleted()
+                : orderService.allOrdersByPriority();
+        List<Map<String, Object>> list = src.stream().map(this::orderMap).collect(Collectors.toList());
         return ResponseEntity.ok(Map.of("orders", list));
     }
 
@@ -199,14 +192,6 @@ public class AdminController {
                 .orElseGet(() -> notFound("Order not found."));
     }
 
-    /**
-     * POST /api/admin/orders
-     * Body: { customer_id, tailor_id?, product_type, product_description,
-     *          due_date (yyyy-MM-dd), expected_price, advance_paid,
-     *          cashback_percent (default 20), cashback_amount,
-     *          expiry_days (default 60), notes,
-     *          assign_cashback: true/false }
-     */
     @PostMapping("/orders")
     public ResponseEntity<Map<String, Object>> createOrder(
             @RequestHeader(value = "Authorization", required = false) String auth,
@@ -214,19 +199,14 @@ public class AdminController {
         if (!isAuthorized(auth)) return unauthorized();
 
         Long customerId = longOrNull(body.get("customer_id"));
-        if (customerId == null)
-            return ResponseEntity.badRequest().body(Map.of("message", "customer_id is required."));
-        if (customerService.findById(customerId).isEmpty())
-            return notFound("Customer not found.");
+        if (customerId == null) return ResponseEntity.badRequest().body(Map.of("message", "customer_id is required."));
+        if (customerService.findById(customerId).isEmpty()) return notFound("Customer not found.");
 
         Order order = new Order();
         order.setCustomerId(customerId);
         order.setTailorId(longOrNull(body.get("tailor_id")));
-
         String pt = str(body.get("product_type")).toUpperCase();
-        try { order.setProductType(Order.ProductType.valueOf(pt)); }
-        catch (Exception e) { order.setProductType(Order.ProductType.OTHER); }
-
+        try { order.setProductType(Order.ProductType.valueOf(pt)); } catch (Exception e) { order.setProductType(Order.ProductType.OTHER); }
         order.setProductDescription(str(body.get("product_description")));
         String dueDateStr = str(body.get("due_date"));
         if (!dueDateStr.isBlank()) order.setDueDate(LocalDate.parse(dueDateStr));
@@ -235,35 +215,36 @@ public class AdminController {
         order.setStatus(Order.Status.ORDER_RECEIVED);
         order.setNotes(str(body.get("notes")));
 
-        Order saved = orderService.createOrder(order);
-
-        // Optionally assign cashback at order creation
-        boolean assignCashback = Boolean.parseBoolean(str(body.get("assign_cashback")));
-        CashbackAssignment cb = null;
-        if (assignCashback) {
-            Integer cbAmount = intOrNull(body.get("cashback_amount"));
-            if (cbAmount != null && cbAmount > 0) {
-                cb = cashbackService.assignCashback(
-                        customerId, saved.getId(),
-                        intOrNull(body.get("cashback_percent")),
-                        cbAmount,
-                        intOrNull(body.get("expiry_days")),
-                        "Order #" + saved.getId());
-            }
+        // #4 apply existing balance FIFO -> net
+        int applied = 0;
+        boolean applyBalance = Boolean.parseBoolean(str(body.get("apply_cashback_balance")));
+        int price = order.getExpectedPrice() != null ? order.getExpectedPrice() : 0;
+        if (applyBalance && price > 0) {
+            applied = cashbackService.applyBalance(customerId, price);
         }
+        order.setAppliedCashbackBalance(applied);
+        int net = Math.max(0, price - applied);
+
+        // cashback-on-delivery: store the intended reward computed on NET
+        boolean assignCashback = Boolean.parseBoolean(str(body.get("assign_cashback")));
+        if (assignCashback) {
+            Integer pct = intOrNull(body.get("cashback_percent"));
+            Integer amt = intOrNull(body.get("cashback_amount"));
+            if (pct != null && pct > 0) amt = (int) Math.round(net * pct / 100.0);
+            order.setPendingCashbackPercent(pct);
+            order.setPendingCashbackAmount(amt);
+            order.setPendingExpiryDays(intOrNull(body.get("expiry_days")));
+        }
+
+        Order saved = orderService.createOrder(order);
 
         Map<String, Object> res = new LinkedHashMap<>();
         res.put("message", "Order created.");
         res.put("order", orderMap(saved));
-        if (cb != null) res.put("cashback", cashbackMap(cb));
+        res.put("applied_cashback_balance", applied);
         return ResponseEntity.ok(res);
     }
 
-    /**
-     * PATCH /api/admin/orders/{id}
-     * Use to update status, price, advance, notes, tailor, due_date.
-     * Admin uses this to manually move status: ORDER_RECEIVED → DELIVERED.
-     */
     @PatchMapping("/orders/{id}")
     public ResponseEntity<Map<String, Object>> updateOrder(
             @RequestHeader(value = "Authorization", required = false) String auth,
@@ -271,30 +252,65 @@ public class AdminController {
             @RequestBody Map<String, Object> body) {
         if (!isAuthorized(auth)) return unauthorized();
 
+        // restore from deleted
+        if (body.containsKey("deleted") && !Boolean.parseBoolean(str(body.get("deleted")))) {
+            boolean ok = orderService.restore(id);
+            return ok ? ResponseEntity.ok(Map.of("message", "Order restored."))
+                      : notFound("Order not found.");
+        }
+
         Order patch = new Order();
         String statusStr = str(body.get("status")).toUpperCase();
-        if (!statusStr.isBlank()) {
-            try { patch.setStatus(Order.Status.valueOf(statusStr)); }
-            catch (Exception e) { /* ignore invalid status */ }
-        }
+        if (!statusStr.isBlank()) { try { patch.setStatus(Order.Status.valueOf(statusStr)); } catch (Exception e) {} }
         String pt = str(body.get("product_type")).toUpperCase();
-        if (!pt.isBlank()) {
-            try { patch.setProductType(Order.ProductType.valueOf(pt)); }
-            catch (Exception e) { /* ignore */ }
-        }
-        String pd = str(body.get("product_description"));
-        if (!pd.isBlank()) patch.setProductDescription(pd);
-        String dd = str(body.get("due_date"));
-        if (!dd.isBlank()) patch.setDueDate(LocalDate.parse(dd));
+        if (!pt.isBlank()) { try { patch.setProductType(Order.ProductType.valueOf(pt)); } catch (Exception e) {} }
+        String pd = str(body.get("product_description")); if (!pd.isBlank()) patch.setProductDescription(pd);
+        String dd = str(body.get("due_date"));            if (!dd.isBlank()) patch.setDueDate(LocalDate.parse(dd));
         patch.setExpectedPrice(intOrNull(body.get("expected_price")));
         patch.setAdvancePaid(intOrNull(body.get("advance_paid")));
-        String notes = str(body.get("notes"));
-        if (!notes.isBlank()) patch.setNotes(notes);
+        String notes = str(body.get("notes")); if (!notes.isBlank()) patch.setNotes(notes);
         patch.setTailorId(longOrNull(body.get("tailor_id")));
 
-        return orderService.updateOrder(id, patch)
-                .map(o -> ResponseEntity.ok(Map.of("message", "Order updated.", "order", orderMap(o))))
-                .orElseGet(() -> notFound("Order not found."));
+        Optional<Order> updatedOpt = orderService.updateOrder(id, patch);
+        if (updatedOpt.isEmpty()) return notFound("Order not found.");
+        Order updated = updatedOpt.get();
+
+        // measurements update on the linked customer (edit modal sends them)
+        String measurements = str(body.get("measurements"));
+        if (!measurements.isBlank()) {
+            customerService.updateMeasurements(updated.getCustomerId(), measurements);
+        }
+
+        // latest-only cashback recalc (edit modal): replace this order's cashback with new figures
+        boolean recalc = Boolean.parseBoolean(str(body.get("recalc_cashback")));
+        if (recalc) {
+            Integer pct = intOrNull(body.get("cashback_percent"));
+            Integer amt = intOrNull(body.get("cashback_amount"));
+            Integer days = intOrNull(body.get("expiry_days"));
+            int price = updated.getExpectedPrice() != null ? updated.getExpectedPrice() : 0;
+            int applied = updated.getAppliedCashbackBalance() != null ? updated.getAppliedCashbackBalance() : 0;
+            int net = Math.max(0, price - applied);
+            if (pct != null && pct > 0) amt = (int) Math.round(net * pct / 100.0);
+
+            cashbackService.removeCashbackForOrder(updated.getId());
+            updated.setPendingCashbackPercent(pct);
+            updated.setPendingCashbackAmount(amt);
+            updated.setPendingExpiryDays(days);
+            updated.setCashbackGranted(false);
+            orderService.grantCashbackIfDelivered(updated); // grant now if already delivered
+        }
+
+        return ResponseEntity.ok(Map.of("message", "Order updated.", "order", orderMap(updated)));
+    }
+
+    @DeleteMapping("/orders/{id}")
+    public ResponseEntity<Map<String, Object>> deleteOrder(
+            @RequestHeader(value = "Authorization", required = false) String auth,
+            @PathVariable Long id) {
+        if (!isAuthorized(auth)) return unauthorized();
+        boolean ok = orderService.softDelete(id);
+        return ok ? ResponseEntity.ok(Map.of("message", "Order deleted (hidden from customer)."))
+                  : notFound("Order not found.");
     }
 
     // ==================== CASHBACKS ====================
@@ -318,7 +334,8 @@ public class AdminController {
         String mobile   = str(body.get("mobile"));
         // Allow assigning by mobile too (Cashbacks tab convenience)
         if (customerId == null && !mobile.isBlank()) {
-            customerId = customerService.findByMobile(mobile).map(Customer::getId).orElse(null);
+            List<Customer> matches = customerService.findAllByMobile(mobile);
+            if (!matches.isEmpty()) customerId = matches.get(0).getId();
         }
         Integer amount  = intOrNull(body.get("cashback_amount"));
         if (customerId == null || amount == null || amount <= 0)
@@ -428,28 +445,39 @@ public class AdminController {
 
     private Map<String, Object> orderMap(Order o) {
         Map<String, Object> m = new LinkedHashMap<>();
-        m.put("id",                  o.getId());
-        m.put("customer_id",         o.getCustomerId());
-        m.put("tailor_id",           o.getTailorId());
-        m.put("product_type",        o.getProductType().name());
+        m.put("id", o.getId());
+        m.put("customer_id", o.getCustomerId());
+        m.put("tailor_id", o.getTailorId());
+        m.put("product_type", o.getProductType().name());
         m.put("product_description", o.getProductDescription());
-        m.put("due_date",            o.getDueDate() != null ? o.getDueDate().toString() : null);
-        m.put("expected_price",      o.getExpectedPrice());
-        m.put("advance_paid",        o.getAdvancePaid());
-        m.put("remaining",           o.getRemaining());
-        m.put("status",              o.getStatus().name());
-        m.put("notes",               o.getNotes());
-        m.put("created_at",          o.getCreatedAt().toString());
-        m.put("updated_at",          o.getUpdatedAt() != null ? o.getUpdatedAt().toString() : null);
+        m.put("due_date", o.getDueDate() != null ? o.getDueDate().toString() : null);
+        m.put("expected_price", o.getExpectedPrice());
+        m.put("advance_paid", o.getAdvancePaid());
+        m.put("applied_cashback_balance", o.getAppliedCashbackBalance());
+        m.put("remaining", o.getRemaining());
+        m.put("status", o.getStatus().name());
+        m.put("notes", o.getNotes());
+        m.put("deleted", o.isDeleted());
+        m.put("created_at", o.getCreatedAt().toString());
+        m.put("updated_at", o.getUpdatedAt() != null ? o.getUpdatedAt().toString() : null);
 
-        // Attach customer name + mobile for list display
+        // cashback for the edit modal: prefer already-granted, else pending
+        List<CashbackAssignment> cbs = cashbackService.getCashbacksByOrder(o.getId());
+        if (!cbs.isEmpty()) {
+            CashbackAssignment cb = cbs.get(0);
+            m.put("cashback_percent", cb.getCashbackPercent());
+            m.put("cashback_amount", cb.getCashbackAmount());
+        } else {
+            m.put("cashback_percent", o.getPendingCashbackPercent());
+            m.put("cashback_amount", o.getPendingCashbackAmount());
+            m.put("cashback_expiry_days", o.getPendingExpiryDays());
+        }
+
         customerService.findById(o.getCustomerId()).ifPresent(c -> {
-            m.put("customer_name",   c.getName());
+            m.put("customer_name", c.getName());
             m.put("customer_mobile", c.getMobile());
         });
-        // Is the order overdue?
-        boolean overdue = o.getDueDate() != null
-                && o.getDueDate().isBefore(LocalDate.now())
+        boolean overdue = o.getDueDate() != null && o.getDueDate().isBefore(LocalDate.now())
                 && o.getStatus() != Order.Status.DELIVERED;
         m.put("overdue", overdue);
         return m;
@@ -468,6 +496,7 @@ public class AdminController {
         m.put("is_expired",       cb.isExpired());
         m.put("is_active",        cb.isActive());
         m.put("notes",            cb.getNotes());
+        m.put("remaining_amount", cb.getRemainingAmount());
 
         // Attach customer name + mobile
         customerService.findById(cb.getCustomerId()).ifPresent(c -> {
