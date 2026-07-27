@@ -12,9 +12,7 @@ import java.util.stream.Collectors;
 
 /**
  * Public API - no auth required.
- * Customers enter their mobile number to view cashback balance + history.
- * A mobile can now belong to several people (name+mobile uniqueness); this
- * endpoint aggregates every person on that number.
+ * Cashback pool is shared by mobile number across all names.
  */
 @RestController
 @RequestMapping("/api/customer")
@@ -35,22 +33,16 @@ public class CustomerController {
 
         if (customers.isEmpty()) {
             return ResponseEntity.ok(Map.of(
-                    "found", false,
-                    "message", "No account found for this number. Visit us to register!",
-                    "cashbacks", List.of(),
+                    "found",       false,
+                    "message",     "No account found for this number. Visit us to register!",
+                    "cashbacks",   List.of(),
                     "live_balance", 0
             ));
         }
 
-        // Aggregate cashback across every person on this mobile.
-        List<CashbackAssignment> history = new ArrayList<>();
-        int liveBalance = 0;
-        for (Customer c : customers) {
-            history.addAll(cashbackService.getCashbacksForCustomer(c.getId()));
-            liveBalance += cashbackService.getLiveBalance(c.getId());
-        }
-        // Oldest first for display
-        history.sort(Comparator.comparing(CashbackAssignment::getAssignedAt));
+        // Pool: all cashbacks across every name on this number
+        List<CashbackAssignment> history = cashbackService.getCashbacksForMobile(clean);
+        int liveBalance = cashbackService.getLiveBalanceForMobile(clean);
 
         List<Map<String, Object>> cashbacks = history.stream().map(cb -> {
             Map<String, Object> m = new LinkedHashMap<>();
@@ -66,9 +58,9 @@ public class CustomerController {
             return m;
         }).collect(Collectors.toList());
 
-        // Show the first name; if several share the number, indicate that.
         String displayName = customers.get(0).getName();
-        if (customers.size() > 1) displayName = displayName + " +" + (customers.size() - 1) + " more";
+        if (customers.size() > 1)
+            displayName = displayName + " +" + (customers.size() - 1) + " more";
 
         Map<String, Object> res = new LinkedHashMap<>();
         res.put("found",         true);

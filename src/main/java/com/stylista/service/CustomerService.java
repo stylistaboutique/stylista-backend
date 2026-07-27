@@ -21,19 +21,28 @@ public class CustomerService {
     }
 
     /**
-     * Add or update keyed on (name + mobile). A repeat (same name+mobile) merges
-     * measurements; a new name on an existing mobile creates a SEPARATE customer.
+     * Add or update keyed on (normalized-name + mobile).
+     * Normalization = trim + collapse internal whitespace + title-case first letter of each word.
+     * This prevents duplicate-insert 500s when the same name is typed with slight
+     * whitespace/case variation (e.g. "ABC New " vs "abc new").
+     *
+     * A genuinely NEW name on an existing mobile creates a SEPARATE customer row.
      */
     public Customer addOrUpdate(String name, String mobile, String measurements) {
-        Optional<Customer> existing = customerRepo.findByNameAndMobile(name, mobile);
+        String normalizedName = normalizeName(name);
+        String normalizedMobile = mobile == null ? "" : mobile.trim();
+
+        Optional<Customer> existing = customerRepo.findByNameIgnoreCaseAndMobile(
+                normalizedName, normalizedMobile);
 
         Customer c = existing.orElseGet(() -> {
             Customer fresh = new Customer();
-            fresh.setMobile(mobile);
-            fresh.setName(name);
+            fresh.setMobile(normalizedMobile);
             return fresh;
         });
-        if (name != null && !name.isBlank()) c.setName(name);
+
+        // Always store the normalized name so DB stays clean
+        c.setName(normalizedName);
 
         if (measurements != null) {
             if (existing.isPresent()) {
@@ -43,6 +52,22 @@ public class CustomerService {
             }
         }
         return customerRepo.save(c);
+    }
+
+    /** Trim, collapse internal spaces, capitalize each word. */
+    public static String normalizeName(String raw) {
+        if (raw == null) return "";
+        String trimmed = raw.trim().replaceAll("\\s+", " ");
+        if (trimmed.isEmpty()) return trimmed;
+        StringBuilder sb = new StringBuilder();
+        for (String word : trimmed.split(" ")) {
+            if (!word.isEmpty()) {
+                sb.append(Character.toUpperCase(word.charAt(0)))
+                  .append(word.substring(1).toLowerCase())
+                  .append(" ");
+            }
+        }
+        return sb.toString().trim();
     }
 
     @SuppressWarnings("unchecked")
@@ -72,12 +97,12 @@ public class CustomerService {
 
     public List<Customer> allCustomers() { return customerRepo.findAll(); }
     public Optional<Customer> findById(Long id) { return customerRepo.findById(id); }
-
-    // Now returns ALL customers on a mobile (may be >1)
     public List<Customer> findAllByMobile(String mobile) { return customerRepo.findByMobile(mobile); }
 
     public Optional<Customer> updateMeasurements(Long id, String measurements) {
-        return customerRepo.findById(id).map(c -> { c.setMeasurements(measurements); return customerRepo.save(c); });
+        return customerRepo.findById(id).map(c -> {
+            c.setMeasurements(measurements); return customerRepo.save(c);
+        });
     }
 
     public long totalCustomers() { return customerRepo.count(); }
