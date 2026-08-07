@@ -51,4 +51,10 @@ public class TailorService {
             return true;
         }).orElse(false);
     }
+
+    public boolean deleteTailor(Long id) {
+        if (!tailorRepo.existsById(id)) return false;
+        tailorRepo.deleteById(id);
+        return true;
+    }
 }

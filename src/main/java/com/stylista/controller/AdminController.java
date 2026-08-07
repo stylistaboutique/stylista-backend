@@ -352,6 +352,52 @@ public class AdminController {
         return ResponseEntity.ok(Map.of("message", "Cashback assigned.", "cashback", cashbackMap(cb)));
     }
 
+    /**
+     * POST /api/admin/cashback/direct
+     * Direct Wallet Credit — no order required, no % cap.
+     * Body: { mobile, name, cashback_amount, expiry_days?, notes, customer_id? }
+     * If customer_id is provided → use that customer.
+     * Else look up by mobile+name → create if not found.
+     * Supports amounts > order value (120% wallet reload etc.)
+     */
+    @PostMapping("/cashback/direct")
+    public ResponseEntity<Map<String, Object>> directWalletCredit(
+            @RequestHeader(value = "Authorization", required = false) String auth,
+            @RequestBody Map<String, Object> body) {
+        if (!isAuthorized(auth)) return unauthorized();
+
+        String mobile = str(body.get("mobile"));
+        String name   = str(body.get("name"));
+        Integer amount = intOrNull(body.get("cashback_amount"));
+        Integer expiryDays = intOrNull(body.get("expiry_days"));
+        String notes  = str(body.get("notes"));
+
+        if (mobile.length() != 10)
+            return ResponseEntity.badRequest().body(Map.of("message", "10-digit mobile required."));
+        if (name.isBlank())
+            return ResponseEntity.badRequest().body(Map.of("message", "Customer name required."));
+        if (amount == null || amount <= 0)
+            return ResponseEntity.badRequest().body(Map.of("message", "cashback_amount must be > 0."));
+        if (notes.isBlank())
+            return ResponseEntity.badRequest().body(Map.of("message", "A label/note is required for wallet credits."));
+
+        int days = (expiryDays != null && expiryDays > 0) ? expiryDays : 90;
+
+        // Resolve or create customer
+        Long customerId = longOrNull(body.get("customer_id"));
+        if (customerId == null) {
+            Customer c = customerService.addOrUpdate(name, mobile, null);
+            customerId = c.getId();
+        } else {
+            // Verify the provided customer_id actually exists
+            if (customerService.findById(customerId).isEmpty())
+                return notFound("Customer not found.");
+        }
+
+        CashbackAssignment cb = cashbackService.assignCashbackDirect(customerId, amount, days, notes);
+        return ResponseEntity.ok(Map.of("message", "Wallet credited.", "cashback", cashbackMap(cb)));
+    }
+
     @PostMapping("/cashback/{id}/redeem")
     public ResponseEntity<Map<String, Object>> redeem(
             @RequestHeader(value = "Authorization", required = false) String auth,
@@ -428,6 +474,21 @@ public class AdminController {
         if (!isAuthorized(auth)) return unauthorized();
         boolean ok = tailorService.deactivateTailor(id);
         if (ok) return ResponseEntity.ok(Map.of("message", "Tailor deactivated."));
+        return notFound("Tailor not found.");
+    }
+
+    /**
+     * DELETE /api/admin/tailors/{id}/permanent
+     * Permanently removes the tailor record. Use with caution — existing orders
+     * referencing this tailor_id will retain the id but the name will show as blank.
+     */
+    @DeleteMapping("/tailors/{id}/permanent")
+    public ResponseEntity<Map<String, Object>> deleteTailorPermanent(
+            @RequestHeader(value = "Authorization", required = false) String auth,
+            @PathVariable Long id) {
+        if (!isAuthorized(auth)) return unauthorized();
+        boolean ok = tailorService.deleteTailor(id);
+        if (ok) return ResponseEntity.ok(Map.of("message", "Tailor permanently deleted."));
         return notFound("Tailor not found.");
     }
 

@@ -197,6 +197,23 @@ public class CashbackService {
         }).orElse(false);
     }
 
+    /**
+     * Direct wallet credit — no order, no % cap.
+     * Skips notification (no phone whatsapp needed for promo credits; add if desired).
+     */
+    public CashbackAssignment assignCashbackDirect(Long customerId, int amount, int expiryDays, String notes) {
+        CashbackAssignment cb = new CashbackAssignment();
+        cb.setCustomerId(customerId);
+        cb.setOrderId(null);           // not linked to any order
+        cb.setCashbackPercent(0);      // % is meaningless for wallet credit
+        cb.setCashbackAmount(amount);
+        cb.setRemainingAmount(amount);
+        cb.setAssignedAt(java.time.LocalDateTime.now());
+        cb.setExpiresAt(java.time.LocalDateTime.now().plusDays(expiryDays));
+        cb.setNotes(notes);
+        return cashbackRepo.save(cb);
+    }
+
     public List<CashbackAssignment> getAllCashbacks() { return cashbackRepo.findAll(); }
 
     public long countActive()  { return cashbackRepo.countByRedeemedFalseAndExpiresAtAfter(LocalDateTime.now()); }
