@@ -19,6 +19,11 @@ public class OrderService {
         this.cashbackService = cashbackService;
     }
 
+    // Persist a modified order entity directly (used by updateOrder wallet recalc)
+    public Order saveOrder(Order order) {
+        return orderRepo.save(order);
+    }
+
     public Order createOrder(Order order) {
         order.setCreatedAt(LocalDateTime.now());
         order.setUpdatedAt(LocalDateTime.now());

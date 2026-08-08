@@ -281,15 +281,37 @@ public class AdminController {
             customerService.updateMeasurements(updated.getCustomerId(), measurements);
         }
 
-        // latest-only cashback recalc (edit modal): replace this order's cashback with new figures
+        // ── Wallet balance recalculation (auto-adjust on price change) ──────────────
+        // prevApplied  = what was consumed from wallet at order-placement time
+        // useBalance   = whether admin wants wallet used on this (updated) order
+        // Logic: newApplied = useBalance ? min(livePool + prevApplied, newPrice) : 0
+        //        delta > 0 → deduct more; delta < 0 → refund excess back to wallet
+        boolean useBalance = Boolean.parseBoolean(str(body.get("apply_cashback_balance")));
+        int prevApplied = intOrDefault(body.get("prev_applied_cashback_balance"), 0);
+        int newPrice    = updated.getExpectedPrice() != null ? updated.getExpectedPrice() : 0;
+
+        // Live wallet balance currently available (does NOT include prevApplied — already spent)
+        int livePool = cashbackService.getLiveBalance(updated.getCustomerId());
+        // Total we can commit to this order = already-spent-on-this-order + still-in-wallet
+        int totalPool = prevApplied + livePool;
+        int newApplied = useBalance ? Math.min(totalPool, newPrice) : 0;
+        int delta = newApplied - prevApplied;   // +ve = deduct more, -ve = refund
+
+        if (delta > 0) {
+            cashbackService.applyBalance(updated.getCustomerId(), delta);
+        } else if (delta < 0) {
+            cashbackService.refundBalance(updated.getCustomerId(), -delta);
+        }
+        updated.setAppliedCashbackBalance(newApplied);
+        orderService.saveOrder(updated);
+
+        // ── Cashback recalc on NET amount ────────────────────────────────────────────
         boolean recalc = Boolean.parseBoolean(str(body.get("recalc_cashback")));
         if (recalc) {
-            Integer pct = intOrNull(body.get("cashback_percent"));
-            Integer amt = intOrNull(body.get("cashback_amount"));
+            Integer pct  = intOrNull(body.get("cashback_percent"));
+            Integer amt  = intOrNull(body.get("cashback_amount"));
             Integer days = intOrNull(body.get("expiry_days"));
-            int price = updated.getExpectedPrice() != null ? updated.getExpectedPrice() : 0;
-            int applied = updated.getAppliedCashbackBalance() != null ? updated.getAppliedCashbackBalance() : 0;
-            int net = Math.max(0, price - applied);
+            int net = Math.max(0, newPrice - newApplied);
             if (pct != null && pct > 0) amt = (int) Math.round(net * pct / 100.0);
 
             cashbackService.removeCashbackForOrder(updated.getId());
