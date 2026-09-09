@@ -157,14 +157,27 @@ public class AdminController {
 
     // ==================== ORDERS ====================
 
+    /**
+     * GET /api/admin/orders
+     * Default: excludes DELIVERED orders (performance — the list keeps growing forever
+     * otherwise) and excludes deleted. Pass status=DELIVERED explicitly to see them,
+     * or include_deleted=true to include soft-deleted orders.
+     */
     @GetMapping("/orders")
     public ResponseEntity<Map<String, Object>> listOrders(
             @RequestHeader(value = "Authorization", required = false) String auth,
-            @RequestParam(value = "include_deleted", required = false, defaultValue = "false") boolean includeDeleted) {
+            @RequestParam(value = "include_deleted", required = false, defaultValue = "false") boolean includeDeleted,
+            @RequestParam(value = "status", required = false) String statusStr) {
         if (!isAuthorized(auth)) return unauthorized();
-        List<Order> src = includeDeleted
-                ? orderService.allOrdersIncludingDeleted()
-                : orderService.allOrdersByPriority();
+
+        Order.Status status = null;
+        if (statusStr != null && !statusStr.isBlank()) {
+            try { status = Order.Status.valueOf(statusStr.toUpperCase()); } catch (Exception e) {}
+        }
+        // Only auto-exclude DELIVERED when no explicit status filter was requested
+        boolean excludeDelivered = (status == null);
+
+        List<Order> src = orderService.listFiltered(includeDeleted, status, excludeDelivered);
         List<Map<String, Object>> list = src.stream().map(this::orderMap).collect(Collectors.toList());
         return ResponseEntity.ok(Map.of("orders", list));
     }
@@ -319,6 +332,7 @@ public class AdminController {
             updated.setPendingCashbackAmount(amt);
             updated.setPendingExpiryDays(days);
             updated.setCashbackGranted(false);
+            orderService.saveOrder(updated);                // BUGFIX: persist pending fields even when NOT yet delivered
             orderService.grantCashbackIfDelivered(updated); // grant now if already delivered
         }
 

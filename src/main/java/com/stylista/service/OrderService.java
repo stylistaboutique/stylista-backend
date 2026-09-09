@@ -36,6 +36,15 @@ public class OrderService {
     public List<Order> allOrdersByPriority() {
         return orderRepo.findAllSortedByDueDateNotDeleted();
     }
+
+    /**
+     * Flexible listing used by GET /orders. status=null means no status filter;
+     * excludeDelivered=true drops DELIVERED rows regardless of status filter
+     * (only matters when status is also null, since a specific status already narrows it).
+     */
+    public List<Order> listFiltered(boolean includeDeleted, Order.Status status, boolean excludeDelivered) {
+        return orderRepo.findFiltered(includeDeleted, status, excludeDelivered, Order.Status.DELIVERED);
+    }
     // Admin "Show deleted" = everything
     public List<Order> allOrdersIncludingDeleted() {
         return orderRepo.findAllSortedByDueDate();

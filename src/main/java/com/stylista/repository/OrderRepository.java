@@ -21,4 +21,20 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
     List<Order> findByCustomerIdAndDeletedFalseOrderByDueDateAsc(Long customerId);
 
     List<Order> findByTailorIdOrderByDueDateAsc(Long tailorId);
+
+    /**
+     * Flexible admin list query:
+     *  - includeDeleted=false -> only non-deleted rows
+     *  - status=null          -> no status filter
+     *  - excludeDelivered=true -> drop DELIVERED rows (used as the default "hide delivered" view)
+     */
+    @Query("SELECT o FROM Order o " +
+           "WHERE (:includeDeleted = true OR o.deleted = false) " +
+           "AND (:status IS NULL OR o.status = :status) " +
+           "AND (:excludeDelivered = false OR o.status <> :deliveredStatus) " +
+           "ORDER BY CASE WHEN o.dueDate IS NULL THEN 1 ELSE 0 END, o.dueDate ASC")
+    List<Order> findFiltered(@org.springframework.data.repository.query.Param("includeDeleted") boolean includeDeleted,
+                              @org.springframework.data.repository.query.Param("status") Order.Status status,
+                              @org.springframework.data.repository.query.Param("excludeDelivered") boolean excludeDelivered,
+                              @org.springframework.data.repository.query.Param("deliveredStatus") Order.Status deliveredStatus);
 }
