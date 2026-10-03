@@ -53,13 +53,24 @@ public class OrderService {
     }
 
     /**
-     * PERF: paginated version of listFiltered. This is what GET /api/admin/orders uses.
+     * PERF + SEARCH: paginated version of listFiltered, with an optional search
+     * term matched against customer name, customer mobile, and product
+     * description -- applied in SQL before the page is sliced, so results fill
+     * page 1 first regardless of how the matches happen to be scattered through
+     * the underlying due-date order.
      * page is 0-indexed; size is clamped by the controller (default 20, max 100).
+     * q may be null/blank for "no search" (normal unfiltered browsing).
      */
     public Page<Order> listFilteredPage(boolean includeDeleted, Order.Status status, boolean excludeDelivered,
-                                         int page, int size) {
-        return orderRepo.findFilteredPage(includeDeleted, status, excludeDelivered, Order.Status.DELIVERED,
+                                         String q, int page, int size) {
+        String qLike = toLikePattern(q);
+        return orderRepo.findFilteredPage(includeDeleted, status, excludeDelivered, Order.Status.DELIVERED, qLike,
                 PageRequest.of(page, size));
+    }
+
+    /** Builds a "%lowercased%" LIKE pattern, or null if q is null/blank (meaning: no search filter). */
+    private static String toLikePattern(String q) {
+        return (q == null || q.isBlank()) ? null : "%" + q.trim().toLowerCase() + "%";
     }
 
     // Admin "Show deleted" = everything

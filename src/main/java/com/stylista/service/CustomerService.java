@@ -120,12 +120,18 @@ public class CustomerService {
     }
 
     /**
-     * PERF: paginated customer list for GET /api/admin/customers. Sorted by id so
-     * paging is stable (no duplicate/skipped rows across pages as new customers
-     * get added between page fetches).
+     * PERF + SEARCH: paginated customer list for GET /api/admin/customers, with
+     * an optional search term matched against name/mobile -- applied in SQL
+     * before the page is sliced (not after, client-side, against only the
+     * current page's rows -- that was the bug where a match on page 2 showed
+     * nothing while viewing page 1).
+     * Sorted by id so paging is stable (no duplicate/skipped rows across pages
+     * as new customers get added between page fetches).
+     * q may be null/blank for "no search" (normal unfiltered browsing).
      */
-    public Page<Customer> listPaged(int page, int size) {
-        return customerRepo.findAll(PageRequest.of(page, size, Sort.by("id").ascending()));
+    public Page<Customer> listPaged(String q, int page, int size) {
+        String qLike = (q == null || q.isBlank()) ? null : "%" + q.trim().toLowerCase() + "%";
+        return customerRepo.searchPage(qLike, PageRequest.of(page, size, Sort.by("id").ascending()));
     }
 
     public Optional<Customer> updateMeasurements(Long id, String measurements) {

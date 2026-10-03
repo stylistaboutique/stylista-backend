@@ -1,7 +1,10 @@
 package com.stylista.repository;
 
 import com.stylista.model.Customer;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
 
 import java.util.Collection;
 import java.util.List;
@@ -21,6 +24,16 @@ public interface CustomerRepository extends JpaRepository<Customer, Long> {
      * they land on different pages.
      */
     List<Customer> findByMobileIn(Collection<String> mobiles);
+
+    /**
+     * SEARCH: paginated customer list with an optional search term, applied in
+     * SQL BEFORE pagination (not after, client-side, against only the current
+     * page -- that was the bug where a match on page 2 showed nothing on page 1).
+     * qLike is null when there's no search text (controller passes null, not "").
+     */
+    @Query("SELECT c FROM Customer c " +
+           "WHERE (:qLike IS NULL OR LOWER(c.name) LIKE :qLike OR c.mobile LIKE :qLike)")
+    Page<Customer> searchPage(@org.springframework.data.repository.query.Param("qLike") String qLike, Pageable pageable);
 
     // Case-insensitive name + exact mobile — used by addOrUpdate to find existing customer
     // Spring Data generates: WHERE LOWER(name) = LOWER(:name) AND mobile = :mobile

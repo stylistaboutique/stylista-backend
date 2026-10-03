@@ -84,21 +84,25 @@ public class AdminController {
     // ==================== CUSTOMERS ====================
 
     /**
-     * GET /api/admin/customers?page=0&size=20
+     * GET /api/admin/customers?page=0&size=20&q=priya
      * PERF: paginated (default 20/page, max 100). live_balance is computed in
      * BULK for the whole page (2 extra queries total, pagination-safe across
      * shared mobiles) instead of one extra round-trip + 2 queries PER ROW.
+     *
+     * SEARCH: q matches name/mobile and is applied in SQL BEFORE pagination, so
+     * matching rows fill page 1 first regardless of where they'd otherwise sort.
      */
     @GetMapping("/customers")
     public ResponseEntity<Map<String, Object>> listCustomers(
             @RequestHeader(value = "Authorization", required = false) String auth,
+            @RequestParam(value = "q", required = false) String q,
             @RequestParam(value = "page", required = false, defaultValue = "0") int page,
             @RequestParam(value = "size", required = false, defaultValue = "20") int size) {
         if (!isAuthorized(auth)) return unauthorized();
         page = clampPage(page);
         size = clampSize(size);
 
-        Page<Customer> pageResult = customerService.listPaged(page, size);
+        Page<Customer> pageResult = customerService.listPaged(q, page, size);
         List<Customer> content = pageResult.getContent();
 
         Map<Long, Integer> balances = cashbackService.getLiveBalancesForCustomerPage(content);
@@ -189,7 +193,7 @@ public class AdminController {
     // ==================== ORDERS ====================
 
     /**
-     * GET /api/admin/orders?page=0&size=20
+     * GET /api/admin/orders?page=0&size=20&q=priya
      * Default: excludes DELIVERED orders (performance — the list keeps growing forever
      * otherwise) and excludes deleted. Pass status=DELIVERED explicitly to see them,
      * or include_deleted=true to include soft-deleted orders.
@@ -199,12 +203,18 @@ public class AdminController {
      * on the page are now resolved via TWO batch queries total (findAllById +
      * findByOrderIdIn), instead of the old 2-queries-PER-ROW N+1 (orderMap() used to call
      * customerService.findById() and cashbackService.getCashbacksByOrder() per row).
+     *
+     * SEARCH: q matches customer name, customer mobile, and product description, and is
+     * applied in SQL BEFORE pagination -- so if only a handful of orders match, they all
+     * land on page 1 (up to `size` of them) instead of being scattered across pages the
+     * way client-side-only filtering of an already-paginated result would leave them.
      */
     @GetMapping("/orders")
     public ResponseEntity<Map<String, Object>> listOrders(
             @RequestHeader(value = "Authorization", required = false) String auth,
             @RequestParam(value = "include_deleted", required = false, defaultValue = "false") boolean includeDeleted,
             @RequestParam(value = "status", required = false) String statusStr,
+            @RequestParam(value = "q", required = false) String q,
             @RequestParam(value = "page", required = false, defaultValue = "0") int page,
             @RequestParam(value = "size", required = false, defaultValue = "20") int size) {
         if (!isAuthorized(auth)) return unauthorized();
@@ -218,7 +228,7 @@ public class AdminController {
         page = clampPage(page);
         size = clampSize(size);
 
-        Page<Order> pageResult = orderService.listFilteredPage(includeDeleted, status, excludeDelivered, page, size);
+        Page<Order> pageResult = orderService.listFilteredPage(includeDeleted, status, excludeDelivered, q, page, size);
         List<Order> content = pageResult.getContent();
 
         // ── Batch-fetch: ONE query for every customer on this page, ONE query for
