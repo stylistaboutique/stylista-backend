@@ -1,13 +1,20 @@
 package com.stylista.service;
 
 import com.stylista.model.CashbackAssignment;
+import com.stylista.model.Customer;
 import com.stylista.repository.CashbackRepository;
 import com.stylista.repository.CustomerRepository;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 @Service
@@ -111,6 +118,60 @@ public class CashbackService {
                 .sum();
     }
 
+    /**
+     * PERF + CORRECTNESS: bulk live-balance computation for a PAGE of customers
+     * from the admin Customers list, in exactly 2 extra queries TOTAL regardless
+     * of page size (instead of the old N+1 -- one getLiveBalance() call per row,
+     * which itself did 2 queries each).
+     *
+     * Pagination-safety note: cashback balance is pooled BY MOBILE NUMBER across
+     * potentially many Customer rows (e.g. a mother and daughter sharing one
+     * mobile are two separate customer_id rows). If we only looked at the
+     * customer_ids present on THIS page, a pair sharing a mobile could straddle
+     * a page boundary and we'd undercount. Fix: first resolve the FULL set of
+     * customer rows for every mobile seen on this page (via findByMobileIn --
+     * one query), THEN pull every cashback row for that full id set (one more
+     * query), and sum per mobile. Every customer on the page then reports the
+     * correct whole-pool balance for their mobile, identical to what
+     * getLiveBalance() would return for them individually.
+     */
+    public Map<Long, Integer> getLiveBalancesForCustomerPage(List<Customer> pageCustomers) {
+        if (pageCustomers == null || pageCustomers.isEmpty()) return Map.of();
+
+        Set<String> mobiles = pageCustomers.stream()
+                .map(Customer::getMobile)
+                .filter(m -> m != null && !m.isBlank())
+                .collect(Collectors.toSet());
+        if (mobiles.isEmpty()) return Map.of();
+
+        // Query #1: every customer row sharing ANY of these mobiles (not just this page)
+        List<Customer> allSharing = customerRepo.findByMobileIn(mobiles);
+        List<Long> allIds = allSharing.stream().map(Customer::getId).collect(Collectors.toList());
+        if (allIds.isEmpty()) return Map.of();
+
+        // Query #2: every active-or-not cashback row for that full id set
+        List<CashbackAssignment> pool = cashbackRepo.findByCustomerIdInOrderByExpiresAtAsc(allIds);
+
+        Map<Long, String> mobileByCustomerId = allSharing.stream()
+                .collect(Collectors.toMap(Customer::getId, Customer::getMobile, (a, b) -> a));
+
+        Map<String, Integer> balanceByMobile = new HashMap<>();
+        for (CashbackAssignment cb : pool) {
+            if (!cb.isActive()) continue;
+            String mobile = mobileByCustomerId.get(cb.getCustomerId());
+            if (mobile == null) continue;
+            int amt = cb.getRemainingAmount() != null ? cb.getRemainingAmount()
+                    : (cb.getCashbackAmount() != null ? cb.getCashbackAmount() : 0);
+            balanceByMobile.merge(mobile, amt, Integer::sum);
+        }
+
+        Map<Long, Integer> result = new HashMap<>();
+        for (Customer c : pageCustomers) {
+            result.put(c.getId(), c.getMobile() == null ? 0 : balanceByMobile.getOrDefault(c.getMobile(), 0));
+        }
+        return result;
+    }
+
     // ─────────────────────────────────────────────────────────────
     //  Spend: FIFO across the whole number's pool.
     //  Uses customerId to resolve the mobile, then drains oldest-
@@ -188,6 +249,16 @@ public class CashbackService {
         return cashbackRepo.findByOrderId(orderId);
     }
 
+    /**
+     * PERF: batch version of getCashbacksByOrder for a whole PAGE of order ids
+     * in ONE query. Used by GET /api/admin/orders to kill the N+1 where every
+     * row on the Orders list used to fire its own findByOrderId() call.
+     */
+    public List<CashbackAssignment> getCashbacksByOrderIds(List<Long> orderIds) {
+        if (orderIds == null || orderIds.isEmpty()) return List.of();
+        return cashbackRepo.findByOrderIdIn(orderIds);
+    }
+
     public boolean markRedeemed(Long cashbackId) {
         return cashbackRepo.findById(cashbackId).map(cb -> {
             cb.setRedeemed(true);
@@ -215,6 +286,14 @@ public class CashbackService {
     }
 
     public List<CashbackAssignment> getAllCashbacks() { return cashbackRepo.findAll(); }
+
+    /**
+     * PERF: paginated cashback list for GET /api/admin/cashbacks, newest-assigned
+     * first (so a freshly-assigned/credited cashback shows up on page 1).
+     */
+    public Page<CashbackAssignment> listPaged(int page, int size) {
+        return cashbackRepo.findAll(PageRequest.of(page, size, Sort.by("assignedAt").descending()));
+    }
 
     public long countActive()  { return cashbackRepo.countByRedeemedFalseAndExpiresAtAfter(LocalDateTime.now()); }
     public long countRedeemed(){ return cashbackRepo.countByRedeemedTrue(); }

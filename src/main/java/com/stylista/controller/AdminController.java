@@ -3,6 +3,7 @@ package com.stylista.controller;
 import com.stylista.model.*;
 import com.stylista.service.*;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.domain.Page;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -48,6 +49,10 @@ public class AdminController {
         return ResponseEntity.status(404).body(Map.of("message", msg));
     }
 
+    // Shared page/size clamp used by every paginated list endpoint below.
+    private int clampPage(int page) { return Math.max(page, 0); }
+    private int clampSize(int size) { if (size < 1) return 20; return Math.min(size, 100); }
+
     // ==================== AUTH ====================
 
     @PostMapping("/login")
@@ -78,13 +83,39 @@ public class AdminController {
 
     // ==================== CUSTOMERS ====================
 
+    /**
+     * GET /api/admin/customers?page=0&size=20
+     * PERF: paginated (default 20/page, max 100). live_balance is computed in
+     * BULK for the whole page (2 extra queries total, pagination-safe across
+     * shared mobiles) instead of one extra round-trip + 2 queries PER ROW.
+     */
     @GetMapping("/customers")
     public ResponseEntity<Map<String, Object>> listCustomers(
-            @RequestHeader(value = "Authorization", required = false) String auth) {
+            @RequestHeader(value = "Authorization", required = false) String auth,
+            @RequestParam(value = "page", required = false, defaultValue = "0") int page,
+            @RequestParam(value = "size", required = false, defaultValue = "20") int size) {
         if (!isAuthorized(auth)) return unauthorized();
-        List<Map<String, Object>> list = customerService.allCustomers().stream()
-                .map(this::customerMap).collect(Collectors.toList());
-        return ResponseEntity.ok(Map.of("customers", list));
+        page = clampPage(page);
+        size = clampSize(size);
+
+        Page<Customer> pageResult = customerService.listPaged(page, size);
+        List<Customer> content = pageResult.getContent();
+
+        Map<Long, Integer> balances = cashbackService.getLiveBalancesForCustomerPage(content);
+
+        List<Map<String, Object>> list = content.stream().map(c -> {
+            Map<String, Object> m = new LinkedHashMap<>(customerMap(c));
+            m.put("live_balance", balances.getOrDefault(c.getId(), 0));
+            return m;
+        }).collect(Collectors.toList());
+
+        Map<String, Object> res = new LinkedHashMap<>();
+        res.put("customers", list);
+        res.put("page", pageResult.getNumber());
+        res.put("size", pageResult.getSize());
+        res.put("total_elements", pageResult.getTotalElements());
+        res.put("total_pages", pageResult.getTotalPages());
+        return ResponseEntity.ok(res);
     }
 
     @GetMapping("/customers/lookup")
@@ -158,16 +189,24 @@ public class AdminController {
     // ==================== ORDERS ====================
 
     /**
-     * GET /api/admin/orders
+     * GET /api/admin/orders?page=0&size=20
      * Default: excludes DELIVERED orders (performance — the list keeps growing forever
      * otherwise) and excludes deleted. Pass status=DELIVERED explicitly to see them,
      * or include_deleted=true to include soft-deleted orders.
+     *
+     * PERF: paginated (default 20/page, max 100 enforced server-side regardless of what
+     * the client asks for). The customer name/mobile and cashback info for every order
+     * on the page are now resolved via TWO batch queries total (findAllById +
+     * findByOrderIdIn), instead of the old 2-queries-PER-ROW N+1 (orderMap() used to call
+     * customerService.findById() and cashbackService.getCashbacksByOrder() per row).
      */
     @GetMapping("/orders")
     public ResponseEntity<Map<String, Object>> listOrders(
             @RequestHeader(value = "Authorization", required = false) String auth,
             @RequestParam(value = "include_deleted", required = false, defaultValue = "false") boolean includeDeleted,
-            @RequestParam(value = "status", required = false) String statusStr) {
+            @RequestParam(value = "status", required = false) String statusStr,
+            @RequestParam(value = "page", required = false, defaultValue = "0") int page,
+            @RequestParam(value = "size", required = false, defaultValue = "20") int size) {
         if (!isAuthorized(auth)) return unauthorized();
 
         Order.Status status = null;
@@ -176,10 +215,35 @@ public class AdminController {
         }
         // Only auto-exclude DELIVERED when no explicit status filter was requested
         boolean excludeDelivered = (status == null);
+        page = clampPage(page);
+        size = clampSize(size);
 
-        List<Order> src = orderService.listFiltered(includeDeleted, status, excludeDelivered);
-        List<Map<String, Object>> list = src.stream().map(this::orderMap).collect(Collectors.toList());
-        return ResponseEntity.ok(Map.of("orders", list));
+        Page<Order> pageResult = orderService.listFilteredPage(includeDeleted, status, excludeDelivered, page, size);
+        List<Order> content = pageResult.getContent();
+
+        // ── Batch-fetch: ONE query for every customer on this page, ONE query for
+        //    every cashback row on this page -- instead of 2 extra queries PER ORDER. ──
+        List<Long> customerIds = content.stream()
+                .map(Order::getCustomerId).filter(Objects::nonNull).distinct().collect(Collectors.toList());
+        List<Long> orderIds = content.stream().map(Order::getId).collect(Collectors.toList());
+
+        Map<Long, Customer> customerById = customerService.findAllByIds(customerIds).stream()
+                .collect(Collectors.toMap(Customer::getId, c -> c));
+        Map<Long, List<CashbackAssignment>> cashbacksByOrderId = cashbackService.getCashbacksByOrderIds(orderIds).stream()
+                .collect(Collectors.groupingBy(CashbackAssignment::getOrderId));
+
+        List<Map<String, Object>> list = content.stream()
+                .map(o -> buildOrderMap(o, customerById.get(o.getCustomerId()),
+                        cashbacksByOrderId.getOrDefault(o.getId(), List.of())))
+                .collect(Collectors.toList());
+
+        Map<String, Object> res = new LinkedHashMap<>();
+        res.put("orders", list);
+        res.put("page", pageResult.getNumber());
+        res.put("size", pageResult.getSize());
+        res.put("total_elements", pageResult.getTotalElements());
+        res.put("total_pages", pageResult.getTotalPages());
+        return ResponseEntity.ok(res);
     }
 
     /**
@@ -351,13 +415,41 @@ public class AdminController {
 
     // ==================== CASHBACKS ====================
 
+    /**
+     * GET /api/admin/cashbacks?page=0&size=20
+     * PERF: paginated (default 20/page, max 100), newest-assigned first. Customer
+     * name/mobile for every row on the page is resolved via ONE batch query
+     * (findAllById) instead of the old cashbackMap() N+1 (one findById() call
+     * per row).
+     */
     @GetMapping("/cashbacks")
     public ResponseEntity<Map<String, Object>> listCashbacks(
-            @RequestHeader(value = "Authorization", required = false) String auth) {
+            @RequestHeader(value = "Authorization", required = false) String auth,
+            @RequestParam(value = "page", required = false, defaultValue = "0") int page,
+            @RequestParam(value = "size", required = false, defaultValue = "20") int size) {
         if (!isAuthorized(auth)) return unauthorized();
-        List<Map<String, Object>> list = cashbackService.getAllCashbacks().stream()
-                .map(this::cashbackMap).collect(Collectors.toList());
-        return ResponseEntity.ok(Map.of("cashbacks", list));
+        page = clampPage(page);
+        size = clampSize(size);
+
+        Page<CashbackAssignment> pageResult = cashbackService.listPaged(page, size);
+        List<CashbackAssignment> content = pageResult.getContent();
+
+        List<Long> customerIds = content.stream()
+                .map(CashbackAssignment::getCustomerId).filter(Objects::nonNull).distinct().collect(Collectors.toList());
+        Map<Long, Customer> customerById = customerService.findAllByIds(customerIds).stream()
+                .collect(Collectors.toMap(Customer::getId, c -> c));
+
+        List<Map<String, Object>> list = content.stream()
+                .map(cb -> buildCashbackMap(cb, customerById.get(cb.getCustomerId())))
+                .collect(Collectors.toList());
+
+        Map<String, Object> res = new LinkedHashMap<>();
+        res.put("cashbacks", list);
+        res.put("page", pageResult.getNumber());
+        res.put("size", pageResult.getSize());
+        res.put("total_elements", pageResult.getTotalElements());
+        res.put("total_pages", pageResult.getTotalPages());
+        return ResponseEntity.ok(res);
     }
 
     @PostMapping("/cashback")
@@ -540,7 +632,24 @@ public class AdminController {
         return m;
     }
 
+    /**
+     * Single-row convenience wrapper -- used by create/update/get-by-id endpoints
+     * where there's only ONE order, so the 2 extra queries here are fine (no N+1
+     * risk since this never runs in a loop over a list).
+     */
     private Map<String, Object> orderMap(Order o) {
+        Customer customer = customerService.findById(o.getCustomerId()).orElse(null);
+        List<CashbackAssignment> cbs = cashbackService.getCashbacksByOrder(o.getId());
+        return buildOrderMap(o, customer, cbs);
+    }
+
+    /**
+     * PERF: list-safe order serializer -- takes the customer + cashback rows as
+     * ALREADY-RESOLVED arguments (from a batch query done once for the whole
+     * page) instead of querying per-row. Used by GET /orders; orderMap() above
+     * wraps this for the single-row call sites.
+     */
+    private Map<String, Object> buildOrderMap(Order o, Customer customer, List<CashbackAssignment> cbs) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id", o.getId());
         m.put("customer_id", o.getCustomerId());
@@ -559,8 +668,7 @@ public class AdminController {
         m.put("updated_at", o.getUpdatedAt() != null ? o.getUpdatedAt().toString() : null);
 
         // cashback for the edit modal: prefer already-granted, else pending
-        List<CashbackAssignment> cbs = cashbackService.getCashbacksByOrder(o.getId());
-        if (!cbs.isEmpty()) {
+        if (cbs != null && !cbs.isEmpty()) {
             CashbackAssignment cb = cbs.get(0);
             m.put("cashback_percent", cb.getCashbackPercent());
             m.put("cashback_amount", cb.getCashbackAmount());
@@ -570,17 +678,31 @@ public class AdminController {
             m.put("cashback_expiry_days", o.getPendingExpiryDays());
         }
 
-        customerService.findById(o.getCustomerId()).ifPresent(c -> {
-            m.put("customer_name", c.getName());
-            m.put("customer_mobile", c.getMobile());
-        });
+        if (customer != null) {
+            m.put("customer_name", customer.getName());
+            m.put("customer_mobile", customer.getMobile());
+        }
         boolean overdue = o.getDueDate() != null && o.getDueDate().isBefore(LocalDate.now())
                 && o.getStatus() != Order.Status.DELIVERED;
         m.put("overdue", overdue);
         return m;
     }
 
+    /**
+     * Single-row convenience wrapper -- used by assignCashback/directWalletCredit
+     * responses where there's only ONE row (no N+1 risk).
+     */
     private Map<String, Object> cashbackMap(CashbackAssignment cb) {
+        Customer customer = customerService.findById(cb.getCustomerId()).orElse(null);
+        return buildCashbackMap(cb, customer);
+    }
+
+    /**
+     * PERF: list-safe cashback serializer -- takes the customer as an
+     * ALREADY-RESOLVED argument (from a batch query done once for the whole
+     * page) instead of querying per-row. Used by GET /cashbacks.
+     */
+    private Map<String, Object> buildCashbackMap(CashbackAssignment cb, Customer customer) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id",               cb.getId());
         m.put("customer_id",      cb.getCustomerId());
@@ -595,11 +717,10 @@ public class AdminController {
         m.put("notes",            cb.getNotes());
         m.put("remaining_amount", cb.getRemainingAmount());
 
-        // Attach customer name + mobile
-        customerService.findById(cb.getCustomerId()).ifPresent(c -> {
-            m.put("customer_name",   c.getName());
-            m.put("customer_mobile", c.getMobile());
-        });
+        if (customer != null) {
+            m.put("customer_name",   customer.getName());
+            m.put("customer_mobile", customer.getMobile());
+        }
         return m;
     }
 

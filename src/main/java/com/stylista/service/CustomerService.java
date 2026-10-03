@@ -3,8 +3,12 @@ package com.stylista.service;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.stylista.model.Customer;
 import com.stylista.repository.CustomerRepository;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Sort;
 import org.springframework.stereotype.Service;
 
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -98,6 +102,31 @@ public class CustomerService {
     public List<Customer> allCustomers() { return customerRepo.findAll(); }
     public Optional<Customer> findById(Long id) { return customerRepo.findById(id); }
     public List<Customer> findAllByMobile(String mobile) { return customerRepo.findByMobile(mobile); }
+
+    /**
+     * PERF: batch lookup by id -- used by the Orders / Cashbacks admin lists to
+     * resolve customer_name/mobile for a whole PAGE of rows in ONE query instead
+     * of one findById() call per row (the N+1 this whole change set exists to fix).
+     */
+    public List<Customer> findAllByIds(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) return List.of();
+        return customerRepo.findAllById(ids);
+    }
+
+    /** PERF: batch lookup by a set of mobiles -- see CashbackService.getLiveBalancesForCustomerPage. */
+    public List<Customer> findAllByMobiles(Collection<String> mobiles) {
+        if (mobiles == null || mobiles.isEmpty()) return List.of();
+        return customerRepo.findByMobileIn(mobiles);
+    }
+
+    /**
+     * PERF: paginated customer list for GET /api/admin/customers. Sorted by id so
+     * paging is stable (no duplicate/skipped rows across pages as new customers
+     * get added between page fetches).
+     */
+    public Page<Customer> listPaged(int page, int size) {
+        return customerRepo.findAll(PageRequest.of(page, size, Sort.by("id").ascending()));
+    }
 
     public Optional<Customer> updateMeasurements(Long id, String measurements) {
         return customerRepo.findById(id).map(c -> {

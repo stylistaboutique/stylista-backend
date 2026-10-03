@@ -1,6 +1,8 @@
 package com.stylista.repository;
 
 import com.stylista.model.Order;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import java.util.List;
@@ -23,7 +25,7 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
     List<Order> findByTailorIdOrderByDueDateAsc(Long tailorId);
 
     /**
-     * Flexible admin list query:
+     * Flexible admin list query (unpaginated, kept for any remaining callers):
      *  - includeDeleted=false -> only non-deleted rows
      *  - status=null          -> no status filter
      *  - excludeDelivered=true -> drop DELIVERED rows (used as the default "hide delivered" view)
@@ -37,4 +39,21 @@ public interface OrderRepository extends JpaRepository<Order, Long> {
                               @org.springframework.data.repository.query.Param("status") Order.Status status,
                               @org.springframework.data.repository.query.Param("excludeDelivered") boolean excludeDelivered,
                               @org.springframework.data.repository.query.Param("deliveredStatus") Order.Status deliveredStatus);
+
+    /**
+     * PERF: same filter/sort as findFiltered, but PAGINATED.
+     * Spring Data auto-derives the COUNT query from this @Query for Page.getTotalElements().
+     * This is what GET /api/admin/orders now uses -- the admin Orders tab never loads the
+     * whole table again, just the current page (default 20 rows).
+     */
+    @Query("SELECT o FROM Order o " +
+           "WHERE (:includeDeleted = true OR o.deleted = false) " +
+           "AND (:status IS NULL OR o.status = :status) " +
+           "AND (:excludeDelivered = false OR o.status <> :deliveredStatus) " +
+           "ORDER BY CASE WHEN o.dueDate IS NULL THEN 1 ELSE 0 END, o.dueDate ASC")
+    Page<Order> findFilteredPage(@org.springframework.data.repository.query.Param("includeDeleted") boolean includeDeleted,
+                                  @org.springframework.data.repository.query.Param("status") Order.Status status,
+                                  @org.springframework.data.repository.query.Param("excludeDelivered") boolean excludeDelivered,
+                                  @org.springframework.data.repository.query.Param("deliveredStatus") Order.Status deliveredStatus,
+                                  Pageable pageable);
 }

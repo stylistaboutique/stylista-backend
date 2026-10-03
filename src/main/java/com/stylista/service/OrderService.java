@@ -2,6 +2,8 @@ package com.stylista.service;
 
 import com.stylista.model.Order;
 import com.stylista.repository.OrderRepository;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -41,10 +43,25 @@ public class OrderService {
      * Flexible listing used by GET /orders. status=null means no status filter;
      * excludeDelivered=true drops DELIVERED rows regardless of status filter
      * (only matters when status is also null, since a specific status already narrows it).
+     *
+     * @deprecated unpaginated -- kept only in case some other caller still needs the
+     * full list. The admin Orders endpoint now uses {@link #listFilteredPage}.
      */
+    @Deprecated
     public List<Order> listFiltered(boolean includeDeleted, Order.Status status, boolean excludeDelivered) {
         return orderRepo.findFiltered(includeDeleted, status, excludeDelivered, Order.Status.DELIVERED);
     }
+
+    /**
+     * PERF: paginated version of listFiltered. This is what GET /api/admin/orders uses.
+     * page is 0-indexed; size is clamped by the controller (default 20, max 100).
+     */
+    public Page<Order> listFilteredPage(boolean includeDeleted, Order.Status status, boolean excludeDelivered,
+                                         int page, int size) {
+        return orderRepo.findFilteredPage(includeDeleted, status, excludeDelivered, Order.Status.DELIVERED,
+                PageRequest.of(page, size));
+    }
+
     // Admin "Show deleted" = everything
     public List<Order> allOrdersIncludingDeleted() {
         return orderRepo.findAllSortedByDueDate();
