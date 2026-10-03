@@ -84,23 +84,33 @@ public class AdminController {
     // ==================== CUSTOMERS ====================
 
     /**
-     * GET /api/admin/customers?page=0&size=20&q=priya
+     * GET /api/admin/customers?page=0&size=20&q=priya&sort=id|balance_desc
      * PERF: paginated (default 20/page, max 100). live_balance is computed in
      * BULK for the whole page (2 extra queries total, pagination-safe across
      * shared mobiles) instead of one extra round-trip + 2 queries PER ROW.
      *
      * SEARCH: q matches name/mobile and is applied in SQL BEFORE pagination, so
      * matching rows fill page 1 first regardless of where they'd otherwise sort.
+     *
+     * SORT: default ("id") keeps the original SQL-paginated path below. Passing
+     * sort=balance_desc routes to listCustomersSortedByBalance(), which sorts by
+     * live wallet balance (highest first) -- see that method's javadoc for why
+     * this can't be a plain SQL ORDER BY.
      */
     @GetMapping("/customers")
     public ResponseEntity<Map<String, Object>> listCustomers(
             @RequestHeader(value = "Authorization", required = false) String auth,
             @RequestParam(value = "q", required = false) String q,
+            @RequestParam(value = "sort", required = false, defaultValue = "id") String sort,
             @RequestParam(value = "page", required = false, defaultValue = "0") int page,
             @RequestParam(value = "size", required = false, defaultValue = "20") int size) {
         if (!isAuthorized(auth)) return unauthorized();
         page = clampPage(page);
         size = clampSize(size);
+
+        if ("balance_desc".equalsIgnoreCase(sort)) {
+            return listCustomersSortedByBalance(q, page, size);
+        }
 
         Page<Customer> pageResult = customerService.listPaged(q, page, size);
         List<Customer> content = pageResult.getContent();
@@ -119,6 +129,53 @@ public class AdminController {
         res.put("size", pageResult.getSize());
         res.put("total_elements", pageResult.getTotalElements());
         res.put("total_pages", pageResult.getTotalPages());
+        return ResponseEntity.ok(res);
+    }
+
+    /**
+     * SORT-BY-BALANCE: wallet balance is a derived/pooled value (summed from
+     * cashback_assignments across every Customer row sharing the same mobile
+     * number at read time) -- it is NOT a persisted column on customers, so it
+     * cannot be ordered with a plain SQL ORDER BY without denormalizing the
+     * schema. Instead: pull every customer (optionally filtered by q, same
+     * name/mobile-contains match as the default search), compute every balance
+     * in 2 bulk queries total via the existing pagination-safe
+     * getLiveBalancesForCustomerPage (safe for any list size, not just a single
+     * page), sort the full list in Java by balance descending (id ascending as a
+     * stable tiebreaker for equal balances), then slice out the requested page
+     * manually. Fine at boutique scale (hundreds to low thousands of rows).
+     */
+    private ResponseEntity<Map<String, Object>> listCustomersSortedByBalance(String q, int page, int size) {
+        List<Customer> all = customerService.findAllFiltered(q);
+        Map<Long, Integer> balances = cashbackService.getLiveBalancesForCustomerPage(all);
+
+        List<Customer> sorted = all.stream()
+                .sorted((a, b) -> {
+                    int balA = balances.getOrDefault(a.getId(), 0);
+                    int balB = balances.getOrDefault(b.getId(), 0);
+                    if (balB != balA) return Integer.compare(balB, balA); // desc
+                    return a.getId().compareTo(b.getId());                 // stable tie-break
+                })
+                .collect(Collectors.toList());
+
+        int totalElements = sorted.size();
+        int totalPages = Math.max(1, (int) Math.ceil(totalElements / (double) size));
+        int from = Math.min(page * size, totalElements);
+        int to = Math.min(from + size, totalElements);
+        List<Customer> pageContent = sorted.subList(from, to);
+
+        List<Map<String, Object>> list = pageContent.stream().map(c -> {
+            Map<String, Object> m = new LinkedHashMap<>(customerMap(c));
+            m.put("live_balance", balances.getOrDefault(c.getId(), 0));
+            return m;
+        }).collect(Collectors.toList());
+
+        Map<String, Object> res = new LinkedHashMap<>();
+        res.put("customers", list);
+        res.put("page", page);
+        res.put("size", size);
+        res.put("total_elements", (long) totalElements);
+        res.put("total_pages", totalPages);
         return ResponseEntity.ok(res);
     }
 

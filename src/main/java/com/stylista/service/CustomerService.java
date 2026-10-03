@@ -13,6 +13,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 @Service
 public class CustomerService {
@@ -128,10 +129,37 @@ public class CustomerService {
      * Sorted by id so paging is stable (no duplicate/skipped rows across pages
      * as new customers get added between page fetches).
      * q may be null/blank for "no search" (normal unfiltered browsing).
+     *
+     * NOTE: this is the "default" sort. For sort-by-balance, AdminController uses
+     * {@link #findAllFiltered} instead, since balance is a derived/pooled value
+     * (not a DB column) and has to be computed before it can be sorted on.
      */
     public Page<Customer> listPaged(String q, int page, int size) {
         String qLike = (q == null || q.isBlank()) ? null : "%" + q.trim().toLowerCase() + "%";
         return customerRepo.searchPage(qLike, PageRequest.of(page, size, Sort.by("id").ascending()));
+    }
+
+    /**
+     * SORT-BY-BALANCE support: full (unpaginated) customer list, optionally
+     * filtered by q (name/mobile contains, case-insensitive). Cashback balance
+     * is pooled by mobile number and summed across cashback_assignments at read
+     * time -- it isn't a persisted column on customers, so it can't be sorted
+     * with a SQL ORDER BY without denormalizing the schema. Instead,
+     * AdminController pulls the full (filtered) list via this method, computes
+     * every balance in 2 bulk queries total (not per-row -- see
+     * CashbackService.getLiveBalancesForCustomerPage), sorts by balance in Java,
+     * and paginates the already-sorted list. Perfectly fine at boutique scale
+     * (hundreds to low thousands of customers); would need revisiting only if
+     * this ever grew to tens of thousands of rows.
+     */
+    public List<Customer> findAllFiltered(String q) {
+        List<Customer> all = customerRepo.findAll();
+        if (q == null || q.isBlank()) return all;
+        String needle = q.trim().toLowerCase();
+        return all.stream()
+                .filter(c -> (c.getName() != null && c.getName().toLowerCase().contains(needle))
+                          || (c.getMobile() != null && c.getMobile().contains(needle)))
+                .collect(Collectors.toList());
     }
 
     public Optional<Customer> updateMeasurements(Long id, String measurements) {
