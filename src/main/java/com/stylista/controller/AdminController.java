@@ -84,7 +84,7 @@ public class AdminController {
     // ==================== CUSTOMERS ====================
 
     /**
-     * GET /api/admin/customers?page=0&size=20&q=priya&sort=id|balance_desc
+     * GET /api/admin/customers?page=0&size=20&q=priya
      * PERF: paginated (default 20/page, max 100). live_balance is computed in
      * BULK for the whole page (2 extra queries total, pagination-safe across
      * shared mobiles) instead of one extra round-trip + 2 queries PER ROW.
@@ -92,16 +92,18 @@ public class AdminController {
      * SEARCH: q matches name/mobile and is applied in SQL BEFORE pagination, so
      * matching rows fill page 1 first regardless of where they'd otherwise sort.
      *
-     * SORT: default ("id") keeps the original SQL-paginated path below. Passing
-     * sort=balance_desc routes to listCustomersSortedByBalance(), which sorts by
-     * live wallet balance (highest first) -- see that method's javadoc for why
-     * this can't be a plain SQL ORDER BY.
+     * SORT: DEFAULT is now balance_desc -- highest wallet balance first -- no
+     * query param or UI toggle needed; this is just how the list comes back.
+     * Routes to listCustomersSortedByBalance(), which sorts by live wallet
+     * balance (highest first) -- see that method's javadoc for why this can't
+     * be a plain SQL ORDER BY. Pass sort=id to opt back into the plain
+     * SQL-paginated (insertion-order) listing if ever needed.
      */
     @GetMapping("/customers")
     public ResponseEntity<Map<String, Object>> listCustomers(
             @RequestHeader(value = "Authorization", required = false) String auth,
             @RequestParam(value = "q", required = false) String q,
-            @RequestParam(value = "sort", required = false, defaultValue = "id") String sort,
+            @RequestParam(value = "sort", required = false, defaultValue = "balance_desc") String sort,
             @RequestParam(value = "page", required = false, defaultValue = "0") int page,
             @RequestParam(value = "size", required = false, defaultValue = "20") int size) {
         if (!isAuthorized(auth)) return unauthorized();
